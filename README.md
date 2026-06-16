@@ -3,9 +3,11 @@
 # ⚠️ Warning: Risk of CPU Damage from Overheating
 
 This page exists because of a real incident: after a thermal event
-triggered PROCHOT on this CPU, the clock speed never recovered on its — the CPU stayed stuck running at a few hundred MHz, even
+triggered PROCHOT on this CPU, the clock speed never recovered on its
+own afterward — the CPU stayed stuck running at a few hundred MHz, even
 at full load, and combination of reboots, BIOS resets, or governor changes
-not brought it back to normal frequencies until the SMU state was forced with this script. In other words, **disabling PROCHOT removes a
+not brought it back to normal frequencies until the SMU state was forced
+back with this script. In other words, **disabling PROCHOT removes a
 core thermal safety feature of your CPU**, but PROCHOT itself can also
 leave the chip in a degraded, stuck-low-frequency state that's hard to
 recover from through normal means. Read this before you run
@@ -167,15 +169,32 @@ profile is applied; `RemainAfterExit` is what keeps it shown as active):
    Active: active (exited) since ...; 18 minutes ago
    Main PID: 944 (code=exited, status=0/SUCCESS)
    ...
-   Profile applied. These settings are NOT
-   persistent across reboots. Run this script
-   again after each boot.
-   systemd[1]: Finished Apply AMD Ryzen Creator Mode OC profile (ryzen_smu).
+--- Load test (10s stress-ng, if available) ---
+Skipped (--no-test).
+===========================================
+Profile applied. Settings are volatile –
+reapply after every boot.
+
 ```
 
 `active (exited)` + `status=0/SUCCESS` confirms the script ran
 successfully once at boot, which is the expected state for this oneshot
 unit.
+
+The service file you have (disable_prochot_mode.service) already calls the script with --no-test. It will apply the default 3600 MHz / VID 103 at every boot. If you later decide you want a different fixed profile (e.g., 3800 MHz / VID 54), just edit the service file:
+
+```bash
+systemctl edit --full disable_prochot_mode.service
+```
+
+```text
+ExecStart=/usr/local/sbin/disable_prochot_mode.sh --freq 3800 --vid 54 --no-test
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart disable_prochot_mode.service
+```
 
 Given everything above, think carefully before enabling this service on
 a machine you don't actively monitor: it means the PROCHOT-disabled,
