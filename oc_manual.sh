@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# oc_test.sh - Incremental OC stability test for Ryzen 5 3600 (Matisse)
+# oc_manual.sh - Incremental OC stability test for Ryzen 5 3600 (Matisse)
 #              using the ryzen_smu kernel module.
 #
 # This script logs every attempt BEFORE applying settings, so if your
@@ -8,9 +8,9 @@
 # Stress-testing is optional but highly recommended.
 #
 # Usage:
-#   Single setting: sudo ./oc_test.sh --freq MHZ --vid VID [--no-test] [--log FILE]
-#   Sequence:       sudo ./oc_test.sh --sequence [OPTIONS] [--no-test] [--log FILE]
-#   Show table:     sudo ./oc_test.sh --list-vid
+#   Single setting: sudo ./oc_manual.sh --freq MHZ --vid VID [--no-test] [--log FILE]
+#   Sequence:       sudo ./oc_manual.sh --sequence [OPTIONS] [--no-test] [--log FILE]
+#   Show table:     sudo ./oc_manual.sh --list-vid
 #   Dry run:        add --dry-run to either mode to see what would happen.
 #
 # Sequence options (all optional, with defaults):
@@ -45,7 +45,7 @@ REC_VIDS=(    70    62    54    46    40    40    40 )
 # ----------------------------------------------------------------------
 # Default log file
 # ----------------------------------------------------------------------
-LOG_FILE="/var/log/oc_test.log"
+LOG_FILE="/var/log/oc_manual.log"
 
 # ----------------------------------------------------------------------
 # Global flags
@@ -95,7 +95,22 @@ show_freqs() {
     echo
 }
 
-# Send SMU command (same as earlier scripts)
+# Check sensors (if available) and log temperatures
+check_sensors() {
+    if command -v sensors &>/dev/null; then
+        local temp_info
+        temp_info=$(sensors 2>/dev/null | grep -E "Tctl|Tdie|CPU|Package" | head -5)
+        if [ -n "$temp_info" ]; then
+            log_msg "SENSORS" "$temp_info"
+        else
+            log_msg "SENSORS" "No temperature data from sensors"
+        fi
+    else
+        log_msg "INFO" "sensors not installed – skipping temperature check"
+    fi
+}
+
+# Send SMU command with retry and delay
 send_smu_cmd() {
     local arg_dec="$1"
     local cmd_hex="$2"
@@ -109,14 +124,29 @@ send_smu_cmd() {
     printf '%0*x' 48 "$arg_dec" | fold -w2 | tac | tr -d '\n' | xxd -r -p > "$DRV/smu_args"
     printf "\\x${cmd_hex}" > "$DRV/rsmu_cmd"
 
-    local status
-    status=$(xxd -p "$DRV/rsmu_cmd" | tr -d '\n')
+    # Wait for command completion and check status (with retry)
+    local status=""
+    local retries=0
+    local max_retries=3
+    while [ $retries -lt $max_retries ]; do
+        status=$(xxd -p "$DRV/rsmu_cmd" | tr -d '\n')
+        if [ "$status" == "01000000" ]; then
+            log_msg "OK" "$label"
+            break
+        fi
+        retries=$((retries + 1))
+        if [ $retries -lt $max_retries ]; then
+            log_msg "WARN" "SMU command $label status=0x$status, retry $retries/$max_retries"
+            sleep 0.1
+        fi
+    done
 
-    if [ "$status" == "01000000" ]; then
-        log_msg "OK" "$label"
-    else
-        log_msg "FAIL" "$label (status=0x$status)"
+    if [ "$status" != "01000000" ]; then
+        log_msg "FAIL" "$label (status=0x$status after $max_retries attempts)"
     fi
+
+    # Small delay after command to let SMU settle
+    sleep 0.05
 }
 
 # Apply a complete profile (enable OC, limits, VID, freq, PROCHOT off)
@@ -127,6 +157,9 @@ apply_profile() {
     voltage=$(vid_to_voltage "$vid")
 
     log_msg "INFO" "Applying profile: ${freq}MHz, VID ${vid} (${voltage}V)"
+
+    # Log temperatures before applying
+    check_sensors
 
     # Clean previous state
     send_smu_cmd 16777216 5b "DisableOverclocking (cleanup)"
@@ -141,6 +174,10 @@ apply_profile() {
     send_smu_cmd "$freq" 5c "SetOverclockFreqAllCores ${freq}MHz"
     # Disable PROCHOT
     send_smu_cmd 16777216 5a "SetPROCHOTStatus Disabled"
+
+    # Log temperatures after applying
+    sleep 0.5  # give system a moment to stabilise
+    check_sensors
 }
 
 # Run stress test (if not skipped)
@@ -164,9 +201,14 @@ run_stress_test() {
     grep MHz /proc/cpuinfo | sort -u
     echo
 
+    # Check sensors during load
+    check_sensors
+
     wait $stress_pid
     if [ $? -eq 0 ]; then
         log_msg "INFO" "Stress test completed successfully"
+        # Log sensors after test
+        check_sensors
         return 0
     else
         log_msg "WARN" "Stress test returned non-zero – possible instability"
@@ -426,3 +468,4 @@ done
 
 log_msg "INFO" "=== Sequence finished successfully ==="
 echo "All steps passed. Check the log: $LOG_FILE"
+
