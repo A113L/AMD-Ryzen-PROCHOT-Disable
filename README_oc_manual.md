@@ -29,6 +29,7 @@ Same as `disable_prochot_mode.sh`:
 
 - A desktop AM4 Ryzen CPU (tested on Ryzen 5 3600 / Matisse)
 - The `ryzen_smu` kernel module, loaded (`lsmod | grep ryzen_smu`)
+- lm-sensors
 - Root privileges
 
 ## Modes
