@@ -82,44 +82,74 @@
 
 set -e
 
-# Allow skipping the stress-ng load test, e.g. when run unattended at boot
-# from a systemd service: disable_prochot_mode.sh --no-test
+# ----------------------------------------------------------------------
+# Defaults
+# ----------------------------------------------------------------------
+FREQ=3600
+VID=103
 SKIP_TEST=0
-if [ "${1:-}" == "--no-test" ]; then
-    SKIP_TEST=1
-fi
 
-DRV="/sys/kernel/ryzen_smu_drv"
-
-if [ ! -d "$DRV" ]; then
-    echo "Error: $DRV not found. Is the ryzen_smu module loaded?"
-    echo "Check with: lsmod | grep ryzen_smu"
-    exit 1
-fi
-
-if [ "$EUID" -ne 0 ]; then
-    echo "This script requires root privileges. Please run: sudo $0"
-    exit 1
-fi
+# Safety caps
+MAX_FREQ=4200
+MIN_VID=40    # ≈ 1.30 V max (lower VID = higher voltage)
+MAX_VID=255
 
 # ----------------------------------------------------------------------
-# send_smu_cmd – sends a 24‑byte little‑endian argument and a command byte
-#   $1 : argument (decimal, up to 64‑bit)
-#   $2 : command ID (hex, e.g., '5a')
-#   $3 : label for logging
+# Recommended VID table (typical Ryzen 5 3600)
 # ----------------------------------------------------------------------
+REC_FREQS=(  3600  3700  3800  3900  4000  4100  4200 )
+REC_VIDS=(    70    62    54    46    40    40    40 )
+
+# ----------------------------------------------------------------------
+# Functions
+# ----------------------------------------------------------------------
+show_vid_table() {
+    echo "Recommended VID table for typical Ryzen 5 3600 (Matisse):"
+    printf "  %-10s %-5s %-10s %s\n" "Freq(MHz)" "VID" "Voltage" "Note"
+    for i in "${!REC_FREQS[@]}"; do
+        f="${REC_FREQS[$i]}"
+        v="${REC_VIDS[$i]}"
+        volt=$(awk "BEGIN {printf \"%.4f\", 1.55 - $v * 0.00625}")
+        note=""
+        [ "$v" -le "$MIN_VID" ] && note="(VID floor – may need >1.3V, blocked by default)"
+        printf "  %-10s %-5s %-10s %s\n" "$f" "$v" "${volt}V" "$note"
+    done
+    echo
+    echo "For a degraded (\"bicked\") chip, start at even lower frequencies"
+    echo "or higher voltages (lower VID numbers)."
+}
+
+show_help() {
+    echo "Usage: $0 [--freq MHZ] [--vid VID] [--no-test] [--list-vid]"
+    echo
+    echo "Apply a manual OC profile on Ryzen 5 3600 via ryzen_smu."
+    echo
+    echo "Options:"
+    echo "  --freq MHZ   All-core frequency (default: 3600, max: $MAX_FREQ)"
+    echo "  --vid VID    Voltage ID (default: 103 → 0.90625 V, floor: $MIN_VID → ~1.30 V)"
+    echo "  --no-test    Skip the 10s stress-ng test"
+    echo "  --list-vid   Print a recommended VID table and exit"
+    echo "  --help       Show this help"
+}
+
+vid_to_voltage() {
+    awk "BEGIN {printf \"%.4f\", 1.55 - $1 * 0.00625}"
+}
+
+show_freqs() {
+    echo "CPU frequencies from /proc/cpuinfo:"
+    grep MHz /proc/cpuinfo | sort -u || true
+    echo
+}
+
 send_smu_cmd() {
     local arg_dec="$1"
     local cmd_hex="$2"
     local label="$3"
 
-    # Convert the decimal argument to a 48‑character (24‑byte) hex string,
-    # reverse byte‑wise (little‑endian), write to smu_args.
     printf '%0*x' 48 "$arg_dec" | fold -w2 | tac | tr -d '\n' | xxd -r -p > "$DRV/smu_args"
-    # Send the command byte.
     printf "\\x${cmd_hex}" > "$DRV/rsmu_cmd"
 
-    # Read the 4‑byte status response (little‑endian).
     local status
     status=$(xxd -p "$DRV/rsmu_cmd" | tr -d '\n')
 
@@ -131,32 +161,106 @@ send_smu_cmd() {
 }
 
 # ----------------------------------------------------------------------
-# Helper: display current CPU frequencies (all unique values)
+# Argument parsing
 # ----------------------------------------------------------------------
-show_freqs() {
-    echo "CPU frequencies from /proc/cpuinfo:"
-    grep MHz /proc/cpuinfo | sort -u || true
-    echo
-}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-test)
+            SKIP_TEST=1
+            shift
+            ;;
+        --freq)
+            FREQ="$2"
+            shift 2
+            ;;
+        --freq=*)
+            FREQ="${1#*=}"
+            shift
+            ;;
+        --vid)
+            VID="$2"
+            shift 2
+            ;;
+        --vid=*)
+            VID="${1#*=}"
+            shift
+            ;;
+        --list-vid)
+            show_vid_table
+            exit 0
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            echo "Usage: $0 [--freq MHZ] [--vid VID] [--no-test] [--list-vid]" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # ----------------------------------------------------------------------
-# Main
+# Validation
+# ----------------------------------------------------------------------
+if ! [[ "$FREQ" =~ ^[0-9]+$ ]]; then
+    echo "Error: --freq must be a positive integer (got: $FREQ)" >&2
+    exit 1
+fi
+if [ "$FREQ" -gt "$MAX_FREQ" ]; then
+    echo "Error: --freq ${FREQ} exceeds maximum allowed (${MAX_FREQ} MHz)" >&2
+    exit 1
+fi
+
+if ! [[ "$VID" =~ ^[0-9]+$ ]]; then
+    echo "Error: --vid must be a non-negative integer (got: $VID)" >&2
+    exit 1
+fi
+if [ "$VID" -gt "$MAX_VID" ] || [ "$VID" -lt "$MIN_VID" ]; then
+    echo "Error: --vid must be between ${MIN_VID} and ${MAX_VID} (got: $VID)" >&2
+    exit 1
+fi
+
+VOLTAGE=$(vid_to_voltage "$VID")
+
+# Optional warning if using default VID with non-default frequency
+if [ "$FREQ" -ne 3600 ] && [ "$VID" -eq 103 ]; then
+    echo "NOTE: Default VID (103 = 0.906 V) was validated only at 3600 MHz." >&2
+    echo "Higher frequencies may be unstable. See --list-vid for guidance." >&2
+    echo
+fi
+
+# ----------------------------------------------------------------------
+# Pre-flight checks
+# ----------------------------------------------------------------------
+DRV="/sys/kernel/ryzen_smu_drv"
+if [ ! -d "$DRV" ]; then
+    echo "Error: $DRV not found. Is the ryzen_smu module loaded?"
+    exit 1
+fi
+if [ "$EUID" -ne 0 ]; then
+    echo "This script requires root. Run: sudo $0"
+    exit 1
+fi
+
+# ----------------------------------------------------------------------
+# Apply profile
 # ----------------------------------------------------------------------
 echo "==========================================="
 echo " AMD Ryzen Creator Mode Profile Applier"
+echo " Target: ${FREQ}MHz, VID ${VID} (${VOLTAGE}V)"
 echo "==========================================="
 echo
 
 echo "--- Current state ---"
 show_freqs
 
-# Optional: reset any previous manual OC state.
-# DisableOverclocking (0x5B, argument 0x1000000 = 16777216)
+# Clean previous OC state
 send_smu_cmd 16777216 5b "DisableOverclocking (cleanup)"
 
 echo
 echo "--- Enabling manual overclocking ---"
-# EnableOverclocking (0x5A, argument 0)
 send_smu_cmd 0 5a "EnableOverclocking"
 
 echo
@@ -166,14 +270,12 @@ send_smu_cmd 114000  54 "SetTDCLimit 114A"
 send_smu_cmd 168000  55 "SetEDCLimit 168A"
 
 echo
-echo "--- Setting VID and all‑core frequency ---"
-# VID = 103 → 1.55 - 103*0.00625 = 0.90625V
-send_smu_cmd 103  61 "SetOverclockCPUVID (0.90625V)"
-send_smu_cmd 3600 5c "SetOverclockFreqAllCores 3600MHz"
+echo "--- Setting VID and all-core frequency ---"
+send_smu_cmd "$VID" 61 "SetOverclockCPUVID (${VOLTAGE}V)"
+send_smu_cmd "$FREQ" 5c "SetOverclockFreqAllCores ${FREQ}MHz"
 
 echo
 echo "--- Disabling PROCHOT ---"
-# SetPROCHOTStatus Disabled (0x5A, argument 0x1000000 = 16777216)
 send_smu_cmd 16777216 5a "SetPROCHOTStatus Disabled"
 
 echo
@@ -182,7 +284,7 @@ sleep 1
 show_freqs
 
 # ----------------------------------------------------------------------
-# Quick load test (optional)
+# Stress test (optional)
 # ----------------------------------------------------------------------
 echo "--- Load test (10s stress-ng, if available) ---"
 if [ "$SKIP_TEST" -eq 1 ]; then
@@ -194,12 +296,11 @@ elif command -v stress-ng &> /dev/null; then
     wait
 else
     echo "stress-ng not installed – skipping load test."
-    echo "Install with: sudo apt install stress-ng"
 fi
 
 echo
 echo "==========================================="
-echo " Profile applied. These settings are NOT"
-echo " persistent across reboots. Run this script"
-echo " again after each boot."
+echo " Profile applied. Settings are volatile –"
+echo " reapply after every boot."
 echo "==========================================="
+
