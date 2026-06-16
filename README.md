@@ -129,8 +129,8 @@ not assume these same IDs are safe on other silicon.
 | `DisableOverclocking (cleanup)` | `0x5b` | `16777216` (`0x1000000`) | Resets any prior manual OC state before applying a fresh profile |
 | `EnableOverclocking` | `0x5a` | `0` | Switches the SMU into manual overclocking mode |
 | `SetPPTLimit` | `0x53` | `1000000` (mW) | Sets the package power limit — 1000 W here, i.e. effectively removed |
-| `SetTDCLimit` | `0x54` | `114000` (mA) | Sets the sustained current limit to 114 A |
-| `SetEDCLimit` | `0x55` | `168000` (mA) | Sets the peak/transient current limit to 168 A |
+| `SetTDCLimit` | `0x54` | `114000` (mA) | Sets the sustained current limit to 114 mA |
+| `SetEDCLimit` | `0x55` | `168000` (mA) | Sets the peak/transient current limit to 168 mA |
 | `SetOverclockCPUVID` | `0x61` | `103` | Fixes core voltage via VID; `1.55 − 103×0.00625 = 0.90625 V` |
 | `SetOverclockFreqAllCores` | `0x5c` | `3600` (MHz) | Locks all cores to a fixed 3600 MHz, disabling per-core boost |
 | `SetPROCHOTStatus Disabled` | `0x5a` | `16777216` (`0x1000000`) | Disables the PROCHOT thermal-throttling signal — see above |
