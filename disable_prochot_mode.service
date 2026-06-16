@@ -1,0 +1,16 @@
+[Unit]
+Description=Apply AMD Ryzen Creator Mode OC profile (ryzen_smu)
+Documentation=https://github.com/leogx9r/ryzen_smu
+# Make sure the ryzen_smu module (loaded via /etc/modules-load.d) is up first
+After=systemd-modules-load.service
+Requires=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/disable_prochot_mode.sh --no-test
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
