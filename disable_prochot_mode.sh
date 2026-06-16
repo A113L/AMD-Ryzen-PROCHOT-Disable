@@ -56,13 +56,13 @@
 # ----------------------------------------------------------------------
 #   Install this script + the included apply-creator-mode.service unit:
 #     sudo install -m 755 disable_prochot_mode.sh /usr/local/sbin/disable_prochot_mode.sh
-#     sudo install -m 644 apply-creator-mode.service /etc/systemd/system/
+#     sudo install -m 644 disable_prochot_mode.service /etc/systemd/system/
 #     sudo systemctl daemon-reload
-#     sudo systemctl enable --now apply-creator-mode.service
+#     sudo systemctl enable --now disable_prochot_mode.service
 #
 #   Check it:
-#     systemctl status apply-creator-mode.service
-#     journalctl -u apply-creator-mode.service -b
+#     systemctl status disable_prochot_mode.service
+#     journalctl -u disable_prochot_mode.service -b
 #
 # Requirements:
 #   - ryzen_smu module loaded (lsmod | grep ryzen_smu)
