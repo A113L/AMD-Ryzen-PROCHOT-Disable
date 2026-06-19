@@ -39,7 +39,7 @@ Same as `disable_prochot_mode.sh`:
 Apply one specific frequency/VID pair and run a stress test against it:
 
 ```bash
-sudo ./oc_manual.sh --freq 3800 --vid 54
+sudo ./oc_manual.sh --freq 3800 --vid 87
 ```
 
 ### 2. Sequence test
