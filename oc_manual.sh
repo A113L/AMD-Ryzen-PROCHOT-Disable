@@ -17,15 +17,18 @@
 #   --start-freq MHZ    Default: 3600
 #   --stop-freq  MHZ    Default: 4200
 #   --step-freq  MHZ    Default: 100
-#   --vid-start  VID    Start VID for the first frequency (default: 85)
-#                       Overrides the linear formula.
+#   --vid-start  VID    Start VID for the first frequency (default: 103)
+#                       Overrides the linear formula. 103 is the validated
+#                       baseline from disable_prochot_mode.sh (3600 MHz,
+#                       0.9062 V).
 #   --vid-step   VID    Decrease VID by this amount per frequency step
 #                       (lower VID = higher voltage). Default: 8
 #                       (≈ +50 mV per 100 MHz)
 #
 # If --vid-start is not given, the script uses a linear model starting at
-# VID 85 for 3600 MHz. Use --list-vid to see a table of recommended,
-# more realistic starting points for a typical chip.
+# VID 103 for 3600 MHz (the same baseline used by disable_prochot_mode.sh).
+# Use --list-vid to see a table of recommended, more realistic starting
+# points for a typical chip, anchored to that same baseline.
 #
 # WARNING: PROCHOT is disabled during the test. Monitor temperatures
 # carefully. Overclocking can permanently damage hardware.
@@ -34,13 +37,17 @@
 set -e
 
 # ----------------------------------------------------------------------
-# Recommended VID table (realistic for typical Ryzen 5 3600)
+# Recommended VID table (anchored to the validated 3600 MHz / VID 103
+# baseline from disable_prochot_mode.sh, stepped at -8 VID per +100 MHz)
 # ----------------------------------------------------------------------
 REC_FREQS=(  3600  3700  3800  3900  4000  4100  4200 )
-REC_VIDS=(    70    62    54    46    40    40    40 )
+REC_VIDS=(    103    95    87    79    71    63    55 )
 # Voltage = 1.55 - VID * 0.00625
-# VID floor (40) = 1.30 V. For 4000+ MHz this may be insufficient;
-# higher voltages (lower VID) are blocked by the safety cap.
+# Baseline: 3600 MHz @ VID 103 = 0.9062 V (same as disable_prochot_mode.sh default).
+# At this step size the table stays above the VID floor (40, ≈1.30 V) all the
+# way to 4200 MHz. The floor is still enforced as a hard safety cap if you
+# push further (e.g. via --vid-start/--vid-step) or extend the range past
+# 4200 MHz.
 
 # ----------------------------------------------------------------------
 # Default log file
@@ -60,7 +67,7 @@ STOP_FREQ=4200
 STEP_FREQ=100
 
 # VID parameters (linear model defaults)
-VID_START_DEFAULT=85   # for 3600 MHz
+VID_START_DEFAULT=103  # for 3600 MHz (matches disable_prochot_mode.sh baseline)
 VID_STEP_DEFAULT=8     # lower VID per +100 MHz
 
 # Command-line overrides
@@ -232,11 +239,14 @@ show_vid_table() {
         printf "  %-10s %-5s %-10s %s\n" "$f" "$v" "${volt}V" "$note"
     done
     echo
-    echo "This table assumes a \"normal\" chip. If your CPU is degraded (\"bricked\"),"
-    echo "start with LOWER frequencies and/or HIGHER voltages (i.e., lower VID numbers)."
-    echo "The script enforces a VID floor of ${MIN_VID} (≈1.3 V max). Frequencies above"
-    echo "3900 MHz may require voltages above this cap, which are blocked by default."
-    echo "For a bricked chip, consider testing only up to 3600-3800 MHz initially."
+    echo "This table assumes a \"normal\" chip and is anchored to the validated"
+    echo "3600 MHz / VID 103 (0.9062V) baseline from disable_prochot_mode.sh, stepped"
+    echo "at -8 VID per +100 MHz. If your CPU is degraded (\"bricked\"), start with"
+    echo "LOWER frequencies and/or HIGHER voltages (i.e., lower VID numbers) than shown."
+    echo "The script enforces a hard VID floor of ${MIN_VID} (≈1.3 V max) regardless of"
+    echo "the table above; it only kicks in if you override --vid-start/--vid-step or"
+    echo "push the range past 4200 MHz. For a bricked chip, consider testing only up"
+    echo "to 3600-3800 MHz initially."
 }
 
 # ----------------------------------------------------------------------
@@ -468,4 +478,3 @@ done
 
 log_msg "INFO" "=== Sequence finished successfully ==="
 echo "All steps passed. Check the log: $LOG_FILE"
-
