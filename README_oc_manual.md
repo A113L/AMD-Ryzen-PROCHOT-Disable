@@ -78,7 +78,7 @@ sudo ./oc_manual.sh --sequence --start-freq 3600 --stop-freq 4200 --dry-run
 | `--start-freq MHZ` | sequence | 3600 | First frequency in the sweep |
 | `--stop-freq MHZ` | sequence | 4200 | Last frequency in the sweep (hard cap, also enforced for single mode) |
 | `--step-freq MHZ` | sequence | 100 | Frequency increment per step |
-| `--vid-start VID` | sequence | 85 (for 3600 MHz) | VID used for the first step; overrides the built-in linear model |
+| `--vid-start VID` | sequence | 103 (for 3600 MHz) | VID used for the first step; overrides the built-in linear model |
 | `--vid-step VID` | sequence | 8 | How much the VID number drops (voltage rises) per frequency step |
 | `--no-test` | both | off | Skip the stress test, just apply and move on |
 | `--dry-run` | both | off | Print the plan/commands without sending anything to the SMU |
@@ -90,29 +90,29 @@ in both modes — lower VID numbers (higher voltage) are rejected outright
 as a sustained-voltage safety cap, not a guarantee anything up to that
 point is safe on your specific chip.
 
-## ⚠️ Important: the sequence default doesn't match the recommended table
+## VID defaults now match the confirmed baseline
 
-These are two independent things and they don't agree with each other:
+`--list-vid` and `--sequence` used to disagree with each other and with
+the value already confirmed stable via `disable_prochot_mode.sh`. That's
+no longer the case — both now use the same anchor:
 
-- `--list-vid` prints a **recommended table** starting at VID 70
-  (≈1.11 V) for 3600 MHz.
-- `--sequence` with no `--vid-start`/`--vid-step` overrides instead uses
-  a **built-in linear model** starting at VID 85 (≈1.02 V) for 3600 MHz
-  and dropping by 8 per 100 MHz step.
+- `--list-vid` prints a **recommended table** starting at VID 103
+  (0.9062 V) for 3600 MHz, stepping -8 VID per +100 MHz.
+- `--sequence` with no `--vid-start`/`--vid-step` overrides uses the
+  same **built-in linear model**: VID 103 at 3600 MHz, dropping by 8
+  per 100 MHz step.
 
-Neither of these matches the VID 103 (0.90625 V) at 3600 MHz that was
-already confirmed stable using `disable_prochot_mode.sh` on this exact
-chip — both are more conservative (lower starting frequency confidence,
-different voltage curve), since they're generic starting points, not
-tuned to this CPU.
+This matches the VID 103 (0.90625 V) at 3600 MHz that was already
+confirmed stable using `disable_prochot_mode.sh` on this exact chip, so
+running `--sequence` with no overrides now builds directly on that
+known-good point instead of a generic, untuned starting guess.
 
-If you want the sequence to build on what you already know works,
-explicitly pass your own confirmed values rather than relying on either
-default, e.g.:
-
-```bash
-sudo ./oc_manual.sh --sequence --start-freq 3600 --vid-start 103 --vid-step 8
-```
+At this step size, the table/sequence stays above the VID floor (40,
+≈1.30 V) all the way through 4200 MHz — the floor is still enforced as
+a hard safety cap, it just isn't reached by the default model within
+this script's frequency range. If you push past 4200 MHz or supply your
+own `--vid-start`/`--vid-step`, the floor can still be hit and the
+sequence will stop there.
 
 Always check `--dry-run` output first to see exactly which frequency/VID
 pairs a given set of flags will actually generate before running it for
@@ -153,3 +153,4 @@ can permanently damage hardware if cooling is inadequate or an unstable
 combination is sustained under load. Neither this project nor its
 author(s) are responsible for hardware damage, data loss, or warranty
 voidance resulting from its use.
+
