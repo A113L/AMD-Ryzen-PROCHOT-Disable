@@ -1,5 +1,4 @@
 #!/bin/bash
-#
 # disable_prochot_mode.sh
 #
 # Replicates the "Creator Mode" profile from AMD Ryzen Master
@@ -95,10 +94,11 @@ MIN_VID=40    # ≈ 1.30 V max (lower VID = higher voltage)
 MAX_VID=255
 
 # ----------------------------------------------------------------------
-# Recommended VID table (typical Ryzen 5 3600)
+# Recommended VID table (anchored to this script's own validated
+# 3600 MHz / VID 103 baseline, stepped at -8 VID per +100 MHz)
 # ----------------------------------------------------------------------
 REC_FREQS=(  3600  3700  3800  3900  4000  4100  4200 )
-REC_VIDS=(    70    62    54    46    40    40    40 )
+REC_VIDS=(    103    95    87    79    71    63    55 )
 
 # ----------------------------------------------------------------------
 # Functions
@@ -115,7 +115,11 @@ show_vid_table() {
         printf "  %-10s %-5s %-10s %s\n" "$f" "$v" "${volt}V" "$note"
     done
     echo
-    echo "For a degraded (\"bicked\") chip, start at even lower frequencies"
+    echo "Anchored to this script's default (3600 MHz, VID 103 = 0.9062V), stepped"
+    echo "at -8 VID per +100 MHz. At this step size the table stays above the VID"
+    echo "floor (${MIN_VID} ≈ 1.30V max) through 4200 MHz; the floor still applies as a"
+    echo "hard safety cap if you go beyond that with --freq/--vid."
+    echo "For a degraded (\"bricked\") chip, start at even lower frequencies"
     echo "or higher voltages (lower VID numbers)."
 }
 
@@ -303,4 +307,3 @@ echo "==========================================="
 echo " Profile applied. Settings are volatile –"
 echo " reapply after every boot."
 echo "==========================================="
-
