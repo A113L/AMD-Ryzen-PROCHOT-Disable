@@ -188,7 +188,7 @@ systemctl edit --full disable_prochot_mode.service
 ```
 
 ```text
-ExecStart=/usr/local/sbin/disable_prochot_mode.sh --freq 3800 --vid 54 --no-test
+ExecStart=/usr/local/sbin/disable_prochot_mode.sh --freq 3800 --vid 87 --no-test
 ```
 
 ```bash
