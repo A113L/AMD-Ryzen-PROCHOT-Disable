@@ -1,5 +1,7 @@
 # AMD Ryzen 5 3600 6-Core Processor PROCHOT Disable
 
+[![ryzen.jpg](https://i.postimg.cc/CKf1Hpc0/ryzen.jpg)](https://postimg.cc/nspppg8S)
+
 # ⚠️ Warning: Risk of CPU Damage from Overheating
 
 This page exists because of a real incident: after a thermal event
