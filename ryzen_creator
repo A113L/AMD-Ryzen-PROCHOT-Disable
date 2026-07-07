@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RYZEN CREATOR — AMD Ryzen SMU Overclocking GUI
+================================================
+A modern Tkinter control panel for Matisse (Ryzen 3600) and compatible
+CPUs using the ryzen_smu kernel module.
+
+Requires root. Settings are volatile.
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, simpledialog, filedialog
+import os
+import sys
+import math
+import time
+import threading
+import binascii
+import subprocess
+import shutil
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Themes (UNIGEN palette)
+# ---------------------------------------------------------------------------
+THEMES = {
+    "dark": {
+        "bg": "#0b0d13",
+        "surface": "#12151d",
+        "surface_alt": "#171b26",
+        "border": "#232838",
+        "input_bg": "#1b2130",
+        "input_fg": "#e8ebf2",
+        "entry_fg": "#ffffff",
+        "text": "#e8ebf2",
+        "text_secondary": "#8b93a5",
+        "text_faint": "#5b6478",
+        "accent": "#f5a623",
+        "accent_hover": "#d88f14",
+        "accent_fg": "#ffffff",
+        "success": "#2dd4bf",
+        "success_hover": "#22b8a5",
+        "danger": "#f0576b",
+        "danger_hover": "#d5405b",
+        "warning": "#f5a623",
+        "trough": "#232838",
+        "select": "#f5a623",
+        "button_bg": "#232838",
+        "button_fg": "#ffffff",
+    },
+    "light": {
+        "bg": "#f4f5f7",
+        "surface": "#ffffff",
+        "surface_alt": "#eef0f4",
+        "border": "#dde1e8",
+        "input_bg": "#eef0f4",
+        "input_fg": "#12151d",
+        "entry_fg": "#000000",
+        "text": "#12151d",
+        "text_secondary": "#5b6478",
+        "text_faint": "#8b93a5",
+        "accent": "#b4740e",
+        "accent_hover": "#96600b",
+        "accent_fg": "#ffffff",
+        "success": "#0d9488",
+        "success_hover": "#0b7a70",
+        "danger": "#dc2626",
+        "danger_hover": "#b91c1c",
+        "warning": "#b4740e",
+        "trough": "#dde1e8",
+        "select": "#b4740e",
+        "button_bg": "#dde1e8",
+        "button_fg": "#ffffff",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Safety defaults & tables
+# ---------------------------------------------------------------------------
+REC_FREQS = [3600, 3700, 3800, 3900, 4000, 4100, 4200]
+REC_VIDS  = [ 103,   95,   87,   79,   71,   63,   55]
+MAX_FREQ = 4200
+MIN_VID = 40
+MAX_VID = 255
+
+SYSTEMD_UNIT = """[Unit]
+Description=Apply AMD Ryzen Creator Mode OC profile (ryzen_smu)
+Documentation=https://github.com/leogx9r/ryzen_smu
+After=systemd-modules-load.service
+Requires=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/disable_prochot_mode.sh --no-test
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+# ---------------------------------------------------------------------------
+# SMU driver interface
+# ---------------------------------------------------------------------------
+DRV = "/sys/kernel/ryzen_smu_drv"
+
+class SMUController:
+    @staticmethod
+    def module_loaded() -> bool:
+        return os.path.isdir(DRV)
+
+    @staticmethod
+    def send_cmd(arg_dec: int, cmd_hex: str) -> bool:
+        try:
+            arg_bytes = arg_dec.to_bytes(24, "little")
+            with open(f"{DRV}/smu_args", "wb") as f:
+                f.write(arg_bytes)
+            with open(f"{DRV}/rsmu_cmd", "wb") as f:
+                f.write(bytes.fromhex(cmd_hex))
+            with open(f"{DRV}/rsmu_cmd", "rb") as f:
+                status = binascii.hexlify(f.read()).decode()
+            return status.startswith("01000000")
+        except Exception as e:
+            raise RuntimeError(f"SMU command 0x{cmd_hex} failed: {e}")
+
+    @classmethod
+    def apply_profile(cls, freq: int, vid: int, disable_prochot: bool = True):
+        ok = True
+        ok &= cls.send_cmd(16777216, "5b")  # DisableOverclocking (cleanup)
+        ok &= cls.send_cmd(0, "5a")          # EnableOverclocking
+        ok &= cls.send_cmd(1000000, "53")    # PPT 1000W
+        ok &= cls.send_cmd(114000, "54")     # TDC 114A
+        ok &= cls.send_cmd(168000, "55")     # EDC 168A
+        ok &= cls.send_cmd(vid, "61")        # VID
+        ok &= cls.send_cmd(freq, "5c")       # All-core freq
+        if disable_prochot:
+            ok &= cls.send_cmd(16777216, "5a")  # PROCHOT off
+        return ok
+
+    @classmethod
+    def reset_to_stock(cls):
+        return cls.send_cmd(16777216, "5b")  # DisableOverclocking
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def vid_to_voltage(vid: int) -> float:
+    return 1.55 - vid * 0.00625
+
+def calculate_entropy(length, pool_size):
+    if pool_size <= 1 or length <= 0:
+        return 0.0
+    return length * math.log2(pool_size)
+
+def get_cpu_freqs():
+    try:
+        out = subprocess.run(["grep", "MHz", "/proc/cpuinfo"], capture_output=True, text=True)
+        lines = out.stdout.strip().splitlines()
+        vals = sorted(set(float(line.split(":")[1].strip()) for line in lines))
+        return vals
+    except Exception:
+        return []
+
+def get_temps():
+    temps = {}
+    try:
+        out = subprocess.run(["sensors"], capture_output=True, text=True)
+        for line in out.stdout.splitlines():
+            if "Tctl" in line or "Tdie" in line or "CPU" in line:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    label = parts[0].strip()
+                    val = parts[1].strip().split()[0]
+                    temps[label] = val
+    except Exception:
+        pass
+    return temps
+
+def run_stress(timeout_sec=10):
+    if not shutil.which("stress-ng"):
+        return None, "stress-ng not installed"
+    try:
+        cpus = os.cpu_count() or 4
+        proc = subprocess.Popen(
+            ["stress-ng", "--cpu", str(cpus), "--timeout", f"{timeout_sec}s"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        return proc, None
+    except Exception as e:
+        return None, str(e)
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+class RyzenCreatorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("RYZEN CREATOR — SMU Overclocking Utility")
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        w = max(1080, min(1280, sw - 80))
+        h = max(720, min(860, sh - 100))
+        x = (sw - w) // 2
+        y = max(0, (sh - h) // 2 - 20)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.root.minsize(1000, 700)
+
+        self.theme_name = "dark"
+        self.theme = THEMES["dark"]
+        self.root.configure(bg=self.theme["bg"])
+
+        self.font_family = "Segoe UI" if sys.platform == "win32" else "Helvetica"
+        self.mono_family = (
+            "Consolas" if sys.platform == "win32" else
+            "Menlo" if sys.platform == "darwin" else
+            "DejaVu Sans Mono"
+        )
+
+        self.active_tab = "profile"
+        self.log_lines = []
+        self.seq_running = False
+        self.seq_thread = None
+        self.monitor_after = None
+        self._trace_ids = []   # store tk variable trace IDs for cleanup
+
+        # Defaults
+        self.freq_var = tk.IntVar(value=3600)
+        self.vid_var = tk.IntVar(value=103)
+        self.prochot_var = tk.BooleanVar(value=True)
+        self.skip_test_var = tk.BooleanVar(value=False)
+
+        # Sequence defaults
+        self.seq_start_freq = tk.IntVar(value=3600)
+        self.seq_stop_freq = tk.IntVar(value=4200)
+        self.seq_step_freq = tk.IntVar(value=100)
+        self.seq_vid_start = tk.IntVar(value=103)
+        self.seq_vid_step = tk.IntVar(value=8)
+        self.seq_stress_sec = tk.IntVar(value=15)
+
+        self.main_frame = tk.Frame(self.root, bg=self.theme["bg"])
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        self.build_ui()
+        self.preflight()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def build_ui(self):
+        self._configure_styles()
+        self.main_frame.columnconfigure(0, weight=1)
+        self.main_frame.rowconfigure(3, weight=1)
+
+        # Header
+        header = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
+        header.columnconfigure(0, weight=1)
+
+        title_frame = tk.Frame(header, bg=self.theme["bg"])
+        title_frame.grid(row=0, column=0, sticky="w")
+        tk.Label(title_frame, text="RYZEN CREATOR", font=(self.font_family, 22, "bold"),
+                 bg=self.theme["bg"], fg=self.theme["accent"]).pack(anchor=tk.W)
+        tk.Label(title_frame, text="AMD Ryzen SMU Overclocking & Monitoring — Matisse / Zen2",
+                 font=(self.font_family, 10), bg=self.theme["bg"], fg=self.theme["text_secondary"]).pack(anchor=tk.W, pady=(1, 0))
+
+        theme_text = "☀  Light" if self.theme_name == "dark" else "☾  Dark"
+        theme_btn = self.make_button(header, theme_text, kind="neutral")
+        theme_btn.config(command=self.switch_theme, font=(self.font_family, 9, "bold"), padx=12, pady=6)
+        theme_btn.grid(row=0, column=1, sticky="e")
+
+        tk.Frame(self.main_frame, bg=self.theme["border"], height=1).grid(row=1, column=0, sticky="ew", padx=18)
+
+        # Tabs
+        tabs_row = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        tabs_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(10, 10))
+        self.tab_buttons = {}
+
+        for key, label in [("profile", "Profile"), ("sequence", "Sequence Test"),
+                           ("monitor", "Monitor"), ("service", "Service")]:
+            btn = tk.Button(tabs_row, text=label, font=(self.font_family, 10, "bold"),
+                            bd=0, padx=16, pady=7, cursor="hand2", relief=tk.FLAT,
+                            command=lambda k=key: self.switch_tab(k))
+            btn.pack(side=tk.LEFT, padx=(0, 8))
+            self.tab_buttons[key] = btn
+
+        self.content_frame = tk.Frame(self.main_frame, bg=self.theme["bg"])
+        self.content_frame.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 14))
+        self.content_frame.columnconfigure(0, weight=1)
+        self.content_frame.rowconfigure(0, weight=1)
+
+        self.build_profile_tab()
+        self.build_sequence_tab()
+        self.build_monitor_tab()
+        self.build_service_tab()
+
+        for frame in (self.profile_frame, self.sequence_frame, self.monitor_frame, self.service_frame):
+            frame.grid(row=0, column=0, sticky="nsew")
+
+        self.show_tab(self.active_tab)
+        self._paint_tabs()
+
+    def _configure_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Accent.Horizontal.TProgressbar",
+                        background=self.theme["accent"], troughcolor=self.theme["trough"],
+                        borderwidth=0, lightcolor=self.theme["accent"], darkcolor=self.theme["accent"])
+
+    def make_button(self, parent, text, kind="neutral", **kwargs):
+        palette = {
+            "accent": (self.theme["accent"], self.theme["accent_hover"], "#ffffff"),
+            "success": (self.theme["success"], self.theme["success_hover"], "#ffffff"),
+            "danger": (self.theme["danger"], self.theme["danger_hover"], "#ffffff"),
+            "neutral": (self.theme["button_bg"], self.theme["input_bg"], "#ffffff"),
+        }[kind]
+        bg, hover, fg = palette
+        if kind == "neutral" and self.theme_name == "light":
+            bg, hover = "#4b5563", "#374151"
+        btn = tk.Button(parent, text=text, font=(self.font_family, 11, "bold"),
+                        bd=0, padx=18, pady=9, bg=bg, fg=fg,
+                        activebackground=hover, activeforeground=fg,
+                        cursor="hand2", relief=tk.FLAT, **kwargs)
+        def on_enter(_e):
+            if str(btn["state"]) != tk.DISABLED:
+                btn.config(bg=hover)
+        def on_leave(_e):
+            if str(btn["state"]) != tk.DISABLED:
+                btn.config(bg=bg)
+        btn.bind("<Enter>", on_enter)
+        btn.bind("<Leave>", on_leave)
+        btn._base_bg = bg
+        return btn
+
+    def create_card(self, parent, title=None, subtitle=None):
+        card = tk.Frame(parent, bg=self.theme["surface"], bd=0,
+                        highlightthickness=1, highlightbackground=self.theme["border"])
+        if title:
+            head = tk.Frame(card, bg=self.theme["surface"])
+            head.pack(fill=tk.X, padx=16, pady=(13, 8))
+            tk.Label(head, text=title, font=(self.font_family, 12, "bold"),
+                     bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W)
+            if subtitle:
+                tk.Label(head, text=subtitle, font=(self.font_family, 9),
+                         bg=self.theme["surface"], fg=self.theme["text_secondary"]).pack(anchor=tk.W, pady=(2, 0))
+            tk.Frame(card, bg=self.theme["border"], height=1).pack(fill=tk.X, padx=16, pady=(0, 10))
+        return card
+
+    def switch_tab(self, tab):
+        self.active_tab = tab
+        self._paint_tabs()
+        self.show_tab(tab)
+        if tab == "monitor":
+            self.start_monitor()
+        else:
+            self.stop_monitor()
+
+    def show_tab(self, tab):
+        for key, frame in [("profile", self.profile_frame), ("sequence", self.sequence_frame),
+                           ("monitor", self.monitor_frame), ("service", self.service_frame)]:
+            if key == tab:
+                frame.lift()
+            else:
+                frame.lower()
+
+    def _paint_tabs(self):
+        for name, btn in self.tab_buttons.items():
+            if name == self.active_tab:
+                btn.config(bg=self.theme["accent"], fg=self.theme["accent_fg"],
+                           activebackground=self.theme["accent_hover"], activeforeground=self.theme["accent_fg"])
+            else:
+                btn.config(bg=self.theme["surface"], fg=self.theme["text_secondary"],
+                           activebackground=self.theme["surface_alt"], activeforeground=self.theme["text"])
+
+    def switch_theme(self):
+        # Cancel monitor before destroying widgets
+        if self.monitor_after:
+            try:
+                self.root.after_cancel(self.monitor_after)
+            except Exception:
+                pass
+            self.monitor_after = None
+        # Remove old tk variable traces so they don't fire on destroyed widgets
+        for var, tid in self._trace_ids:
+            try:
+                var.trace_remove("write", tid)
+            except Exception:
+                pass
+        self._trace_ids.clear()
+        new_theme = "light" if self.theme_name == "dark" else "dark"
+        self.theme_name = new_theme
+        self.theme = THEMES[new_theme]
+        self.root.configure(bg=self.theme["bg"])
+        self.main_frame.destroy()
+        self.main_frame = tk.Frame(self.root, bg=self.theme["bg"])
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
+        self.build_ui()
+
+    # ------------------------------------------------------------------
+    # Profile Tab
+    # ------------------------------------------------------------------
+    def build_profile_tab(self):
+        self.profile_frame = tk.Frame(self.content_frame, bg=self.theme["bg"])
+        self.profile_frame.columnconfigure(0, weight=0)
+        self.profile_frame.columnconfigure(1, weight=1)
+        self.profile_frame.rowconfigure(0, weight=1)
+
+        # Sidebar settings
+        sidebar = self.create_card(self.profile_frame, title="Profile Settings")
+        sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 14))
+        sidebar.configure(width=320)
+        sidebar.grid_propagate(False)
+
+        # Frequency
+        tk.Label(sidebar, text="All-Core Frequency (MHz)", font=(self.font_family, 10, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(0, 4))
+        frow = tk.Frame(sidebar, bg=self.theme["surface"])
+        frow.pack(fill=tk.X, padx=16, pady=(0, 12))
+        self.freq_slider = tk.Scale(frow, from_=3000, to=MAX_FREQ, orient=tk.HORIZONTAL,
+                                    variable=self.freq_var, bg=self.theme["surface"], fg=self.theme["accent"],
+                                    highlightthickness=0, troughcolor=self.theme["trough"], bd=0,
+                                    activebackground=self.theme["accent"], showvalue=0,
+                                    command=self._on_freq_change, sliderrelief=tk.FLAT)
+        self.freq_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.freq_spin = tk.Spinbox(frow, from_=3000, to=MAX_FREQ, width=5, textvariable=self.freq_var,
+                                    bg=self.theme["input_bg"], fg=self.theme["input_fg"],
+                                    insertbackground=self.theme["input_fg"], font=(self.mono_family, 10),
+                                    buttonbackground=self.theme["button_bg"], bd=0, relief=tk.FLAT,
+                                    command=self._on_freq_change)
+        self.freq_spin.pack(side=tk.RIGHT, padx=(8, 0))
+        self._trace_ids.append((self.freq_var, self.freq_var.trace_add("write", lambda *a: self._on_freq_change())))
+
+        # VID
+        tk.Label(sidebar, text="Voltage ID (VID)", font=(self.font_family, 10, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(0, 4))
+        vrow = tk.Frame(sidebar, bg=self.theme["surface"])
+        vrow.pack(fill=tk.X, padx=16, pady=(0, 4))
+        self.vid_slider = tk.Scale(vrow, from_=MIN_VID, to=MAX_VID, orient=tk.HORIZONTAL,
+                                   variable=self.vid_var, bg=self.theme["surface"], fg=self.theme["accent"],
+                                   highlightthickness=0, troughcolor=self.theme["trough"], bd=0,
+                                   activebackground=self.theme["accent"], showvalue=0,
+                                   command=self._on_vid_change, sliderrelief=tk.FLAT)
+        self.vid_slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.vid_spin = tk.Spinbox(vrow, from_=MIN_VID, to=MAX_VID, width=5, textvariable=self.vid_var,
+                                   bg=self.theme["input_bg"], fg=self.theme["input_fg"],
+                                   insertbackground=self.theme["input_fg"], font=(self.mono_family, 10),
+                                   buttonbackground=self.theme["button_bg"], bd=0, relief=tk.FLAT,
+                                   command=self._on_vid_change)
+        self.vid_spin.pack(side=tk.RIGHT, padx=(8, 0))
+        self._trace_ids.append((self.vid_var, self.vid_var.trace_add("write", lambda *a: self._on_vid_change())))
+
+        self.voltage_label = tk.Label(sidebar, text="Voltage: 0.9062 V", font=(self.mono_family, 10, "bold"),
+                                      bg=self.theme["surface"], fg=self.theme["accent"])
+        self.voltage_label.pack(anchor=tk.W, padx=16, pady=(0, 14))
+
+        # Presets
+        tk.Label(sidebar, text="Presets", font=(self.font_family, 10, "bold"),
+                 bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(0, 4))
+        pre_frame = tk.Frame(sidebar, bg=self.theme["surface"])
+        pre_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
+        self.make_button(pre_frame, "Creator Mode", kind="accent",
+                         command=self.preset_creator).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.make_button(pre_frame, "Stock", kind="neutral",
+                         command=self.preset_stock).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self.make_button(pre_frame, "Table", kind="neutral",
+                         command=self.show_vid_table).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+        # Options
+        tk.Frame(sidebar, bg=self.theme["border"], height=1).pack(fill=tk.X, padx=16, pady=(8, 8))
+        cb = tk.Checkbutton(sidebar, text="Disable PROCHOT", variable=self.prochot_var,
+                            bg=self.theme["surface"], fg=self.theme["text"],
+                            selectcolor=self.theme["accent"], activebackground=self.theme["surface"],
+                            font=(self.font_family, 9, "bold"))
+        cb.pack(anchor=tk.W, padx=16)
+        cb2 = tk.Checkbutton(sidebar, text="Skip stress test after apply", variable=self.skip_test_var,
+                             bg=self.theme["surface"], fg=self.theme["text_secondary"],
+                             selectcolor=self.theme["accent"], activebackground=self.theme["surface"],
+                             font=(self.font_family, 9))
+        cb2.pack(anchor=tk.W, padx=16, pady=(4, 0))
+
+        # Warnings
+        tk.Frame(sidebar, bg=self.theme["border"], height=1).pack(fill=tk.X, padx=16, pady=(10, 8))
+        tk.Label(sidebar, text="⚠ Settings are volatile.\nRe-apply after every boot.",
+                 font=(self.font_family, 9, "bold"), bg=self.theme["surface"], fg=self.theme["warning"],
+                 justify=tk.LEFT).pack(anchor=tk.W, padx=16)
+        tk.Label(sidebar, text="Ensure adequate cooling & VRM capacity.",
+                 font=(self.font_family, 9), bg=self.theme["surface"], fg=self.theme["danger"],
+                 justify=tk.LEFT).pack(anchor=tk.W, padx=16, pady=(4, 0))
+
+        # Main column
+        main_col = tk.Frame(self.profile_frame, bg=self.theme["bg"])
+        main_col.grid(row=0, column=1, sticky="nsew")
+        main_col.columnconfigure(0, weight=1)
+        main_col.rowconfigure(2, weight=1)
+
+        # Stats cards
+        stats_frame = tk.Frame(main_col, bg=self.theme["bg"])
+        stats_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        stats_frame.columnconfigure((0, 1, 2, 3), weight=1)
+        self.profile_stat_cards = {}
+        for i, (title, key) in enumerate([("PPT", "ppt"), ("TDC", "tdc"), ("EDC", "edc"), ("Voltage", "volt")]):
+            card = tk.Frame(stats_frame, bg=self.theme["surface"], padx=14, pady=10,
+                            highlightthickness=1, highlightbackground=self.theme["border"])
+            card.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
+            tk.Label(card, text=title, font=(self.font_family, 9),
+                     bg=self.theme["surface"], fg=self.theme["text_secondary"]).pack(anchor=tk.W)
+            lbl = tk.Label(card, text="-", font=(self.mono_family, 16, "bold"),
+                           bg=self.theme["surface"], fg=self.theme["text"])
+            lbl.pack(anchor=tk.W, pady=(3, 0))
+            self.profile_stat_cards[key] = lbl
+        self._update_profile_stats()
+
+        # Apply button
+        btn_frame = tk.Frame(main_col, bg=self.theme["bg"])
+        btn_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.apply_btn = self.make_button(btn_frame, "Apply Profile", kind="danger")
+        self.apply_btn.config(command=self.apply_profile_dialog, font=(self.font_family, 12, "bold"))
+        self.apply_btn.pack(fill=tk.X, ipady=3)
+
+        # Output / Log
+        out_card = self.create_card(main_col, title="Status & CPU State")
+        out_card.grid(row=2, column=0, sticky="nsew")
+        out_card.columnconfigure(0, weight=1)
+        out_card.rowconfigure(0, weight=1)
+
+        twrap = tk.Frame(out_card, bg=self.theme["surface"])
+        twrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        self.profile_text = scrolledtext.ScrolledText(twrap, wrap=tk.WORD, bg=self.theme["bg"],
+                                                      fg=self.theme["text"], insertbackground=self.theme["text"],
+                                                      font=(self.mono_family, 10), bd=0, padx=10, pady=10, relief=tk.FLAT)
+        self.profile_text.pack(fill=tk.BOTH, expand=True)
+        self.profile_text.insert(tk.END, "Ready. Verify root privileges and that ryzen_smu is loaded.\n")
+        self.profile_text.config(state=tk.DISABLED)
+
+        self.profile_status = tk.Label(out_card, text="", font=(self.font_family, 9),
+                                       bg=self.theme["surface"], fg=self.theme["text_secondary"])
+        self.profile_status.pack(anchor=tk.W, padx=16, pady=(0, 10))
+
+    def _on_freq_change(self, *_):
+        try:
+            v = self.freq_var.get()
+            if v < 3000:
+                self.freq_var.set(3000)
+            elif v > MAX_FREQ:
+                self.freq_var.set(MAX_FREQ)
+        except Exception:
+            pass
+        try:
+            self._update_profile_stats()
+        except tk.TclError:
+            pass
+
+    def _on_vid_change(self, *_):
+        try:
+            v = self.vid_var.get()
+            if v < MIN_VID:
+                self.vid_var.set(MIN_VID)
+            elif v > MAX_VID:
+                self.vid_var.set(MAX_VID)
+        except Exception:
+            pass
+        try:
+            self._update_profile_stats()
+        except tk.TclError:
+            pass
+
+    def _update_profile_stats(self):
+        try:
+            self.profile_stat_cards["ppt"].config(text="1000 W")
+            self.profile_stat_cards["tdc"].config(text="114 A")
+            self.profile_stat_cards["edc"].config(text="168 A")
+            v = vid_to_voltage(self.vid_var.get())
+            self.profile_stat_cards["volt"].config(text=f"{v:.4f} V")
+            self.voltage_label.config(text=f"Voltage: {v:.4f} V")
+        except tk.TclError:
+            # Widget was destroyed (e.g. during theme switch) — ignore
+            pass
+
+    def preset_creator(self):
+        self.freq_var.set(3600)
+        self.vid_var.set(103)
+        self.prochot_var.set(True)
+
+    def preset_stock(self):
+        self.freq_var.set(3600)
+        self.vid_var.set(120)
+        self.prochot_var.set(False)
+
+    def show_vid_table(self):
+        win = tk.Toplevel(self.root)
+        win.title("Recommended VID Table")
+        win.configure(bg=self.theme["bg"])
+        win.geometry("500x400")
+        txt = scrolledtext.ScrolledText(win, wrap=tk.NONE, bg=self.theme["bg"], fg=self.theme["text"],
+                                        font=(self.mono_family, 10), padx=10, pady=10)
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert(tk.END, "Recommended VID table (anchored to 3600 MHz / VID 103 baseline):\n\n")
+        txt.insert(tk.END, f"{'Freq (MHz)':<12} {'VID':<6} {'Voltage':<12} Note\n")
+        txt.insert(tk.END, "-" * 50 + "\n")
+        for f, v in zip(REC_FREQS, REC_VIDS):
+            volt = vid_to_voltage(v)
+            note = ""
+            if v <= MIN_VID:
+                note = "(VID floor)"
+            txt.insert(tk.END, f"{f:<12} {v:<6} {volt:.4f} V    {note}\n")
+        txt.insert(tk.END, "\nStep size: -8 VID per +100 MHz.\n")
+        txt.insert(tk.END, "For degraded chips, start lower / use higher voltage (lower VID).\n")
+        txt.config(state=tk.DISABLED)
+
+    def log(self, msg, tag="INFO"):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] [{tag}] {msg}\n"
+        self.log_lines.append(line)
+        for widget in (getattr(self, "profile_text", None), getattr(self, "seq_text", None)):
+            if widget:
+                try:
+                    widget.config(state=tk.NORMAL)
+                    widget.insert(tk.END, line)
+                    widget.see(tk.END)
+                    widget.config(state=tk.DISABLED)
+                except tk.TclError:
+                    pass
+
+    def apply_profile_dialog(self):
+        if not self.preflight():
+            return
+        freq = self.freq_var.get()
+        vid = self.vid_var.get()
+        volt = vid_to_voltage(vid)
+        prochot = self.prochot_var.get()
+        msg = (f"Apply profile?\n\n"
+               f"Frequency: {freq} MHz\n"
+               f"VID: {vid} ({volt:.4f} V)\n"
+               f"PROCHOT: {'Disabled' if prochot else 'Enabled'}\n\n"
+               f"PPT=1000W  TDC=114A  EDC=168A\n\n"
+               f"These settings are volatile and require adequate cooling.")
+        if not messagebox.askyesno("Confirm Apply", msg, icon="warning"):
+            return
+        self._do_apply(freq, vid, prochot)
+
+    def _do_apply(self, freq, vid, disable_prochot):
+        self.profile_status.config(text="Applying…", fg=self.theme["accent"])
+        self.root.update()
+        try:
+            ok = SMUController.apply_profile(freq, vid, disable_prochot)
+            if ok:
+                self.log(f"Profile applied: {freq} MHz, VID {vid} ({vid_to_voltage(vid):.4f}V)", "OK")
+                self.profile_status.config(text="Profile applied successfully.", fg=self.theme["success"])
+            else:
+                self.log("SMU reported failure for one or more commands.", "FAIL")
+                self.profile_status.config(text="SMU command failure — check logs", fg=self.theme["danger"])
+        except Exception as e:
+            self.log(str(e), "ERROR")
+            self.profile_status.config(text=f"Error: {e}", fg=self.theme["danger"])
+            return
+
+        # Show freqs
+        freqs = get_cpu_freqs()
+        if freqs:
+            self.log(f"Current CPU frequencies: {freqs}", "INFO")
+
+        if not self.skip_test_var.get():
+            self.log("Starting 10s stress test…", "INFO")
+            self.root.update()
+            proc, err = run_stress(10)
+            if proc:
+                try:
+                    proc.wait(timeout=12)
+                    self.log("Stress test completed.", "OK")
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    self.log("Stress test timed out.", "WARN")
+            elif err:
+                self.log(f"Stress test skipped: {err}", "WARN")
+            freqs = get_cpu_freqs()
+            if freqs:
+                self.log(f"Frequencies under load: {freqs}", "INFO")
+
+    # ------------------------------------------------------------------
+    # Sequence Tab
+    # ------------------------------------------------------------------
+    def build_sequence_tab(self):
+        self.sequence_frame = tk.Frame(self.content_frame, bg=self.theme["bg"])
+        self.sequence_frame.columnconfigure(0, weight=0)
+        self.sequence_frame.columnconfigure(1, weight=1)
+        self.sequence_frame.rowconfigure(0, weight=1)
+
+        sidebar = self.create_card(self.sequence_frame, title="Sequence Settings")
+        sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 14))
+        sidebar.configure(width=320)
+        sidebar.grid_propagate(False)
+
+        def make_spin(parent, label, var, from_, to, unit=""):
+            tk.Label(parent, text=label, font=(self.font_family, 10, "bold"),
+                     bg=self.theme["surface"], fg=self.theme["text"]).pack(anchor=tk.W, padx=16, pady=(8, 2))
+            fr = tk.Frame(parent, bg=self.theme["surface"])
+            fr.pack(fill=tk.X, padx=16, pady=(0, 4))
+            sp = tk.Spinbox(fr, from_=from_, to=to, width=6, textvariable=var,
+                            bg=self.theme["input_bg"], fg=self.theme["input_fg"],
+                            insertbackground=self.theme["input_fg"], font=(self.mono_family, 10),
+                            buttonbackground=self.theme["button_bg"], bd=0, relief=tk.FLAT)
+            sp.pack(side=tk.LEFT)
+            if unit:
+                tk.Label(fr, text=unit, font=(self.font_family, 9),
+                         bg=self.theme["surface"], fg=self.theme["text_secondary"]).pack(side=tk.LEFT, padx=(4, 0))
+
+        make_spin(sidebar, "Start Frequency", self.seq_start_freq, 3000, MAX_FREQ, "MHz")
+        make_spin(sidebar, "Stop Frequency", self.seq_stop_freq, 3000, MAX_FREQ, "MHz")
+        make_spin(sidebar, "Step", self.seq_step_freq, 25, 500, "MHz")
+        make_spin(sidebar, "Start VID", self.seq_vid_start, MIN_VID, MAX_VID, "")
+        make_spin(sidebar, "VID Step", self.seq_vid_step, 1, 50, "per step (lower=higher V)")
+        make_spin(sidebar, "Stress Duration", self.seq_stress_sec, 5, 120, "seconds")
+
+        tk.Frame(sidebar, bg=self.theme["border"], height=1).pack(fill=tk.X, padx=16, pady=(10, 8))
+
+        self.seq_run_btn = self.make_button(sidebar, "Run Sequence", kind="accent")
+        self.seq_run_btn.config(command=self.start_sequence, font=(self.font_family, 11, "bold"))
+        self.seq_run_btn.pack(fill=tk.X, padx=16, pady=4)
+
+        self.seq_stop_btn = self.make_button(sidebar, "Stop", kind="danger")
+        self.seq_stop_btn.config(command=self.stop_sequence, state=tk.DISABLED)
+        self.seq_stop_btn.pack(fill=tk.X, padx=16, pady=4)
+
+        self.seq_status = tk.Label(sidebar, text="Idle", font=(self.font_family, 10, "bold"),
+                                   bg=self.theme["surface"], fg=self.theme["text_secondary"])
+        self.seq_status.pack(anchor=tk.W, padx=16, pady=(8, 0))
+
+        # Main log area
+        main_col = tk.Frame(self.sequence_frame, bg=self.theme["bg"])
+        main_col.grid(row=0, column=1, sticky="nsew")
+        main_col.columnconfigure(0, weight=1)
+        main_col.rowconfigure(0, weight=1)
+
+        out_card = self.create_card(main_col, title="Sequence Log")
+        out_card.grid(row=0, column=0, sticky="nsew")
+        out_card.columnconfigure(0, weight=1)
+        out_card.rowconfigure(0, weight=1)
+
+        twrap = tk.Frame(out_card, bg=self.theme["surface"])
+        twrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
+        self.seq_text = scrolledtext.ScrolledText(twrap, wrap=tk.WORD, bg=self.theme["bg"],
+                                                   fg=self.theme["text"], insertbackground=self.theme["text"],
+                                                   font=(self.mono_family, 10), bd=0, padx=10, pady=10, relief=tk.FLAT)
+        self.seq_text.pack(fill=tk.BOTH, expand=True)
+        self.seq_text.insert(tk.END, "Sequence mode will step through frequencies and test each one.\n")
+        self.seq_text.config(state=tk.DISABLED)
+
+    def start_sequence(self):
+        if not self.preflight():
+            return
+        if self.seq_running:
+            return
+        start = self.seq_start_freq.get()
+        stop = self.seq_stop_freq.get()
+        step = self.seq_step_freq.get()
+        vstart = self.seq_vid_start.get()
+        vstep = self.seq_vid_step.get()
+        stress_sec = self.seq_stress_sec.get()
+
+        if start > stop:
+            messagebox.showerror("Error", "Start frequency must be <= stop frequency.")
+            return
+
+        self.seq_running = True
+        self.seq_run_btn.config(state=tk.DISABLED)
+        self.seq_stop_btn.config(state=tk.NORMAL)
+        self.seq_status.config(text="Running…", fg=self.theme["accent"])
+        self.seq_text.config(state=tk.NORMAL)
+        self.seq_text.delete(1.0, tk.END)
+        self.seq_text.config(state=tk.DISABLED)
+        self.log("=== Sequence started ===", "INFO")
+
+        self.seq_thread = threading.Thread(target=self._sequence_worker,
+                                           args=(start, stop, step, vstart, vstep, stress_sec),
+                                           daemon=True)
+        self.seq_thread.start()
+
+    def _sequence_worker(self, start, stop, step, vstart, vstep, stress_sec):
+        try:
+            freq = start
+            vid = vstart
+            step_num = 1
+            while freq <= stop and self.seq_running:
+                if vid < MIN_VID:
+                    self.log(f"VID {vid} below floor {MIN_VID} — stopping.", "WARN")
+                    break
+                self.log(f"--- Step {step_num}: {freq} MHz, VID {vid} ({vid_to_voltage(vid):.4f}V) ---", "INFO")
+                try:
+                    ok = SMUController.apply_profile(freq, vid, True)
+                    if not ok:
+                        self.log("SMU command failure — aborting sequence.", "FAIL")
+                        break
+                except Exception as e:
+                    self.log(f"SMU error: {e} — aborting.", "ERROR")
+                    break
+
+                time.sleep(1)
+                freqs = get_cpu_freqs()
+                if freqs:
+                    self.log(f"Frequencies: {freqs}", "INFO")
+
+                # Stress
+                self.log(f"Stress test ({stress_sec}s)…", "INFO")
+                proc, err = run_stress(stress_sec)
+                if proc:
+                    try:
+                        rc = proc.wait(timeout=stress_sec + 5)
+                        if rc != 0:
+                            self.log(f"Stress test failed (exit {rc}) — stopping sequence.", "FAIL")
+                            break
+                        self.log("Stress test passed.", "OK")
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        self.log("Stress test timed out — stopping sequence.", "WARN")
+                        break
+                elif err:
+                    self.log(f"No stress-ng: {err}", "WARN")
+
+                temps = get_temps()
+                if temps:
+                    self.log(f"Temps: {temps}", "INFO")
+
+                freq += step
+                vid -= vstep
+                step_num += 1
+
+            if self.seq_running:
+                self.log("=== Sequence finished ===", "OK")
+                self.seq_status.config(text="Finished", fg=self.theme["success"])
+            else:
+                self.log("=== Sequence stopped by user ===", "WARN")
+                self.seq_status.config(text="Stopped", fg=self.theme["warning"])
+        finally:
+            self.seq_running = False
+            self.seq_run_btn.config(state=tk.NORMAL)
+            self.seq_stop_btn.config(state=tk.DISABLED)
+
+    def stop_sequence(self):
+        self.seq_running = False
+        self.seq_status.config(text="Stopping…", fg=self.theme["warning"])
+
+    # ------------------------------------------------------------------
+    # Monitor Tab
+    # ------------------------------------------------------------------
+    def build_monitor_tab(self):
+        self.monitor_frame = tk.Frame(self.content_frame, bg=self.theme["bg"])
+        self.monitor_frame.columnconfigure(0, weight=1)
+        self.monitor_frame.rowconfigure(0, weight=0)
+        self.monitor_frame.rowconfigure(1, weight=1)
+
+        stats = tk.Frame(self.monitor_frame, bg=self.theme["bg"])
+        stats.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        stats.columnconfigure((0, 1, 2, 3), weight=1)
+        self.mon_cards = {}
+        for i, (title, key) in enumerate([("Avg Freq", "freq"), ("Tctl", "tctl"),
+                                           ("Tdie", "tdie"), ("Core Count", "cores")]):
+            card = tk.Frame(stats, bg=self.theme["surface"], padx=14, pady=10,
+                            highlightthickness=1, highlightbackground=self.theme["border"])
+            card.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
+            tk.Label(card, text=title, font=(self.font_family, 9),
+                     bg=self.theme["surface"], fg=self.theme["text_secondary"]).pack(anchor=tk.W)
+            lbl = tk.Label(card, text="-", font=(self.mono_family, 18, "bold"),
+                           bg=self.theme["surface"], fg=self.theme["text"])
+            lbl.pack(anchor=tk.W, pady=(3, 0))
+            self.mon_cards[key] = lbl
+        self.mon_cards["cores"].config(text=str(os.cpu_count() or "-"))
+
+        out_card = self.create_card(self.monitor_frame, title="Live Log")
+        out_card.grid(row=1, column=0, sticky="nsew")
+        out_card.columnconfigure(0, weight=1)
+        out_card.rowconfigure(0, weight=1)
+        twrap = tk.Frame(out_card, bg=self.theme["surface"])
+        twrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
+        self.mon_text = scrolledtext.ScrolledText(twrap, wrap=tk.WORD, bg=self.theme["bg"],
+                                                   fg=self.theme["text"], insertbackground=self.theme["text"],
+                                                   font=(self.mono_family, 10), bd=0, padx=10, pady=10, relief=tk.FLAT)
+        self.mon_text.pack(fill=tk.BOTH, expand=True)
+        self.mon_text.insert(tk.END, "Monitoring starts when you open this tab.\n")
+        self.mon_text.config(state=tk.DISABLED)
+
+    def start_monitor(self):
+        self._tick_monitor()
+
+    def stop_monitor(self):
+        if self.monitor_after:
+            try:
+                self.root.after_cancel(self.monitor_after)
+            except Exception:
+                pass
+            self.monitor_after = None
+
+    def _tick_monitor(self):
+        try:
+            freqs = get_cpu_freqs()
+            if freqs:
+                avg = sum(freqs) / len(freqs)
+                self.mon_cards["freq"].config(text=f"{avg:.0f} MHz")
+            temps = get_temps()
+            self.mon_cards["tctl"].config(text=temps.get("Tctl", "-"))
+            self.mon_cards["tdie"].config(text=temps.get("Tdie", "-"))
+        except tk.TclError:
+            pass
+        self.monitor_after = self.root.after(2000, self._tick_monitor)
+
+    # ------------------------------------------------------------------
+    # Service Tab
+    # ------------------------------------------------------------------
+    def build_service_tab(self):
+        self.service_frame = tk.Frame(self.content_frame, bg=self.theme["bg"])
+        self.service_frame.columnconfigure(0, weight=1)
+        self.service_frame.rowconfigure(0, weight=1)
+
+        card = self.create_card(self.service_frame, title="Systemd Service Manager",
+                                subtitle="Manage the persistent boot-time OC service")
+        card.grid(row=0, column=0, sticky="nsew")
+        card.columnconfigure(0, weight=1)
+
+        info = tk.Frame(card, bg=self.theme["surface"])
+        info.pack(fill=tk.X, padx=16, pady=8)
+        self.svc_status_label = tk.Label(info, text="Checking…", font=(self.mono_family, 11, "bold"),
+                                         bg=self.theme["surface"], fg=self.theme["text"])
+        self.svc_status_label.pack(anchor=tk.W)
+        self.svc_path_label = tk.Label(info, text="Unit: /etc/systemd/system/disable_prochot_mode.service",
+                                       font=(self.font_family, 9), bg=self.theme["surface"], fg=self.theme["text_secondary"])
+        self.svc_path_label.pack(anchor=tk.W, pady=(4, 0))
+
+        tk.Frame(card, bg=self.theme["border"], height=1).pack(fill=tk.X, padx=16, pady=(8, 8))
+
+        btn_row = tk.Frame(card, bg=self.theme["surface"])
+        btn_row.pack(fill=tk.X, padx=16, pady=4)
+        self.svc_install_btn = self.make_button(btn_row, "Install Unit", kind="neutral")
+        self.svc_install_btn.config(command=self.install_unit)
+        self.svc_install_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
+        self.svc_enable_btn = self.make_button(btn_row, "Enable", kind="success")
+        self.svc_enable_btn.config(command=lambda: self.run_systemctl("enable"))
+        self.svc_enable_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        self.svc_start_btn = self.make_button(btn_row, "Start", kind="accent")
+        self.svc_start_btn.config(command=lambda: self.run_systemctl("start"))
+        self.svc_start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        self.svc_stop_btn = self.make_button(btn_row, "Stop", kind="danger")
+        self.svc_stop_btn.config(command=lambda: self.run_systemctl("stop"))
+        self.svc_stop_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        self.svc_refresh_btn = self.make_button(btn_row, "Refresh", kind="neutral")
+        self.svc_refresh_btn.config(command=self.refresh_service_status)
+        self.svc_refresh_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+        self.svc_output = scrolledtext.ScrolledText(card, wrap=tk.WORD, bg=self.theme["bg"], fg=self.theme["text"],
+                                                     font=(self.mono_family, 10), bd=0, padx=10, pady=10, height=12)
+        self.svc_output.pack(fill=tk.BOTH, expand=True, padx=16, pady=(8, 10))
+        self.svc_output.insert(tk.END, "Service output will appear here.\n")
+        self.svc_output.config(state=tk.DISABLED)
+
+        self.refresh_service_status()
+
+    def refresh_service_status(self):
+        try:
+            out = subprocess.run(["systemctl", "status", "disable_prochot_mode.service", "--no-pager"],
+                                 capture_output=True, text=True)
+            text = out.stdout + out.stderr
+            active = "active" in out.stdout.lower() and "running" in out.stdout.lower()
+            loaded = "loaded" in out.stdout.lower()
+            if active:
+                self.svc_status_label.config(text="Status: ACTIVE (Running)", fg=self.theme["success"])
+            elif loaded:
+                self.svc_status_label.config(text="Status: Installed (Not running)", fg=self.theme["warning"])
+            else:
+                self.svc_status_label.config(text="Status: Not installed", fg=self.theme["text_secondary"])
+        except Exception as e:
+            text = f"Could not query systemd: {e}"
+            self.svc_status_label.config(text="Status: Unknown", fg=self.theme["danger"])
+        self.svc_output.config(state=tk.NORMAL)
+        self.svc_output.delete(1.0, tk.END)
+        self.svc_output.insert(tk.END, text)
+        self.svc_output.config(state=tk.DISABLED)
+
+    def install_unit(self):
+        unit_path = "/etc/systemd/system/disable_prochot_mode.service"
+        if not messagebox.askyesno("Install Unit",
+                                   f"Write systemd unit to:\n{unit_path}\n\nRequires root."):
+            return
+        try:
+            with open(unit_path, "w") as f:
+                f.write(SYSTEMD_UNIT)
+            subprocess.run(["systemctl", "daemon-reload"], check=True, capture_output=True)
+            messagebox.showinfo("Installed", f"Unit installed to {unit_path}")
+            self.refresh_service_status()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def run_systemctl(self, action):
+        try:
+            out = subprocess.run(["systemctl", action, "disable_prochot_mode.service"],
+                                 capture_output=True, text=True)
+            self.svc_output.config(state=tk.NORMAL)
+            self.svc_output.delete(1.0, tk.END)
+            self.svc_output.insert(tk.END, out.stdout + out.stderr)
+            self.svc_output.config(state=tk.DISABLED)
+            self.refresh_service_status()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # ------------------------------------------------------------------
+    # Preflight
+    # ------------------------------------------------------------------
+    def preflight(self) -> bool:
+        if os.geteuid() != 0:
+            messagebox.showerror("Root Required", "This application must be run as root.\n\nUse: sudo python3 ryzen_creator_gui.py")
+            return False
+        if not SMUController.module_loaded():
+            messagebox.showerror("Module Missing", "The ryzen_smu kernel module is not loaded.\n\nRun: sudo modprobe ryzen_smu")
+            return False
+        return True
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    root = tk.Tk()
+    if sys.platform == "win32":
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+    app = RyzenCreatorApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
