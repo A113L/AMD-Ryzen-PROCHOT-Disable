@@ -3,7 +3,7 @@
 """
 RYZEN CREATOR — AMD Ryzen SMU Overclocking GUI
 ================================================
-A modern Tkinter control panel for Matisse (Ryzen 3600) and compatible
+A modern Tkinter control panel for Matisse (Ryzen 3000) and compatible
 CPUs using the ryzen_smu kernel module.
 
 Requires root. Settings are volatile.
@@ -101,6 +101,9 @@ StandardError=journal
 WantedBy=multi-user.target
 """
 
+LOG_FILE = "/var/log/ryzen_creator.log"
+MAX_LOG_LINES = 5000
+
 # ---------------------------------------------------------------------------
 # SMU driver interface
 # ---------------------------------------------------------------------------
@@ -165,10 +168,11 @@ def get_cpu_freqs():
 
 def get_temps():
     temps = {}
+    # 1. Try 'sensors' first (for convenience)
     try:
         out = subprocess.run(["sensors"], capture_output=True, text=True)
         for line in out.stdout.splitlines():
-            if "Tctl" in line or "Tdie" in line or "CPU" in line:
+            if "Tctl" in line or "Tdie" in line or "Tccd1" in line or "Tccd2" in line or "CPU" in line:
                 parts = line.split(":")
                 if len(parts) == 2:
                     label = parts[0].strip()
@@ -176,6 +180,27 @@ def get_temps():
                     temps[label] = val
     except Exception:
         pass
+
+    # 2. Fallback: read /sys/class/hwmon directly (guaranteed if driver exposes it)
+    if "Tdie" not in temps or "Tctl" not in temps:
+        try:
+            for hwmon in Path("/sys/class/hwmon").glob("hwmon*"):
+                name_file = hwmon / "name"
+                if not name_file.exists():
+                    continue
+                name = name_file.read_text().strip()
+                if name in ("k10temp", "zenpower"):
+                    for temp_input in sorted(hwmon.glob("temp*_input")):
+                        label_file = hwmon / temp_input.name.replace("input", "label")
+                        if label_file.exists():
+                            label = label_file.read_text().strip()
+                            raw = int(temp_input.read_text().strip())
+                            val = f"{raw / 1000:.1f}°C"
+                            if label in ("Tctl", "Tdie", "Tccd1", "Tccd2"):
+                                temps[label] = val
+        except Exception:
+            pass
+
     return temps
 
 def run_stress(timeout_sec=10):
@@ -246,6 +271,7 @@ class RyzenCreatorApp:
         self.root.rowconfigure(0, weight=1)
 
         self.build_ui()
+        self._startup_log()
         self.preflight()
 
     # ------------------------------------------------------------------
@@ -791,7 +817,15 @@ class RyzenCreatorApp:
                 if vid < MIN_VID:
                     self.log(f"VID {vid} below floor {MIN_VID} — stopping.", "WARN")
                     break
-                self.log(f"--- Step {step_num}: {freq} MHz, VID {vid} ({vid_to_voltage(vid):.4f}V) ---", "INFO")
+                self.log(f"=== STEP {step_num} | Target: {freq} MHz | VID: {vid} | Voltage: {vid_to_voltage(vid):.4f}V ===", "INFO")
+                # CRITICAL: flush log to disk BEFORE applying OC so hang cause is recorded
+                try:
+                    with open(LOG_FILE, "a") as f:
+                        f.write(f"[PENDING] Applying {freq} MHz / VID {vid} / {vid_to_voltage(vid):.4f}V\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass
                 try:
                     ok = SMUController.apply_profile(freq, vid, True)
                     if not ok:
@@ -806,7 +840,20 @@ class RyzenCreatorApp:
                 if freqs:
                     self.log(f"Frequencies: {freqs}", "INFO")
 
-                # Stress
+                # Log temps before stress so if we hang during stress, last known temps are on disk
+                temps = get_temps()
+                if temps:
+                    self.log(f"Temps before stress: {temps}", "INFO")
+
+                # CRITICAL: flush log to disk BEFORE starting stress test
+                try:
+                    with open(LOG_FILE, "a") as f:
+                        f.write(f"[PENDING] Starting {stress_sec}s stress test at {freq} MHz / VID {vid}\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass
+
                 self.log(f"Stress test ({stress_sec}s)…", "INFO")
                 proc, err = run_stress(stress_sec)
                 if proc:
@@ -825,7 +872,7 @@ class RyzenCreatorApp:
 
                 temps = get_temps()
                 if temps:
-                    self.log(f"Temps: {temps}", "INFO")
+                    self.log(f"Temps after stress: {temps}", "INFO")
 
                 freq += step
                 vid -= vstep
@@ -904,7 +951,9 @@ class RyzenCreatorApp:
                 self.mon_cards["freq"].config(text=f"{avg:.0f} MHz")
             temps = get_temps()
             self.mon_cards["tctl"].config(text=temps.get("Tctl", "-"))
-            self.mon_cards["tdie"].config(text=temps.get("Tdie", "-"))
+            # Fallback: Tdie → Tccd1 → Tccd2
+            tdie = temps.get("Tdie") or temps.get("Tccd1") or temps.get("Tccd2") or "-"
+            self.mon_cards["tdie"].config(text=tdie)
         except tk.TclError:
             pass
         self.monitor_after = self.root.after(2000, self._tick_monitor)
@@ -1021,6 +1070,17 @@ class RyzenCreatorApp:
             messagebox.showerror("Module Missing", "The ryzen_smu kernel module is not loaded.\n\nRun: sudo modprobe ryzen_smu")
             return False
         return True
+
+    def _startup_log(self):
+        """Write a startup banner to the persistent log so reboots are obvious."""
+        try:
+            banner = f"\n{'='*60}\nRYZEN CREATOR started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n{'='*60}\n"
+            with open(LOG_FILE, "a") as f:
+                f.write(banner)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Main
